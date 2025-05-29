@@ -200,7 +200,7 @@ func extractSeasonAndEpisode(filename string) (int, int) {
 			2,
 		}, // S1E01 or S01E01 or S1 01 etc
 		{regexp.MustCompile(`E(\d+)`), 0, 1},              // E01
-		{regexp.MustCompile(`\s-\s(\d+)`), 0, 1},          // - 01
+		{regexp.MustCompile(`\s-\s\(?(\d+)\)?`), 0, 1},    // - 01 or - (01)
 		{regexp.MustCompile(`\s(\d{2,3})(?:\s|$)`), 0, 1}, // 01 or 001 at the end or before space
 	}
 
