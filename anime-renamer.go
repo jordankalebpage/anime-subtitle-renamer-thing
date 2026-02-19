@@ -608,7 +608,7 @@ func buildTempPath(oldPath string, index int) (string, error) {
 	dir := filepath.Dir(oldPath)
 	base := filepath.Base(oldPath)
 
-	for attempt := 0; attempt < 1000; attempt++ {
+	for attempt := range 1000 {
 		candidate := filepath.Join(
 			dir,
 			fmt.Sprintf(".anime-renamer-tmp-%d-%d-%s", os.Getpid(), index*1000+attempt, base),
