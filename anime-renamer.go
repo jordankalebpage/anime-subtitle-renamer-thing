@@ -34,7 +34,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,116 +57,242 @@ type FilePair struct {
 	Subtitle FileInfo
 }
 
+type RenameOperation struct {
+	OldPath string
+	NewPath string
+}
+
+type AppConfig struct {
+	FolderPath string
+	AnimeName  string
+	DryRun     bool
+}
+
+type episodePattern struct {
+	regex        *regexp.Regexp
+	seasonIndex  int
+	episodeIndex int
+}
+
+type PreflightError struct {
+	Issues []string
+}
+
+func (e *PreflightError) Error() string {
+	return "preflight checks failed:\n - " + strings.Join(e.Issues, "\n - ")
+}
+
+type RenameExecutionError struct {
+	Phase string
+	From  string
+	To    string
+	Err   error
+}
+
+func (e *RenameExecutionError) Error() string {
+	return fmt.Sprintf("rename failed during %s (%s -> %s): %v", e.Phase, e.From, e.To, e.Err)
+}
+
+func (e *RenameExecutionError) Unwrap() error {
+	return e.Err
+}
+
+type renameExecutor func(oldPath string, newPath string) error
+
+type renameState struct {
+	RenameOperation
+	TempPath    string
+	CurrentPath string
+}
+
+var stdinReader = bufio.NewReader(os.Stdin)
+
+var episodePatterns = []episodePattern{
+	{regex: regexp.MustCompile(`(?i)S(\d+)\s*-\s*(\d+)`), seasonIndex: 1, episodeIndex: 2},
+	{regex: regexp.MustCompile(`(?i)S(\d+)(?:\s|E)(\d+)`), seasonIndex: 1, episodeIndex: 2},
+	{regex: regexp.MustCompile(`(?i)E(\d+)`), seasonIndex: 0, episodeIndex: 1},
+	{regex: regexp.MustCompile(`\s-\s\(?(\d+)\)?`), seasonIndex: 0, episodeIndex: 1},
+	{regex: regexp.MustCompile(`\s(\d{2,3})(?:\s|$)`), seasonIndex: 0, episodeIndex: 1},
+}
+
+var flexiblePattern = regexp.MustCompile(`\d+`)
+
+var videoExtensions = []string{".mkv", ".mp4", ".avi"}
+
+var subtitleExtensions = []string{".srt", ".ass"}
+
 func main() {
-	folderPath := getUserInputLine(
-		"Enter the path to the folder containing the videos and subtitles:",
-	)
-	if folderPath == "" {
-		exitWithError("Error: Folder path is empty")
+	config, err := loadConfig()
+	if err != nil {
+		exitWithError(err)
 	}
 
-	fmt.Printf("Debug: Folder path entered: %s\n", folderPath)
+	videoFiles, err := findFiles(config.FolderPath, videoExtensions)
+	if err != nil {
+		exitWithError(err)
+	}
 
-	animeName := getUserInputLine("Enter the name of the anime:")
-
-	// Use a default flexible naming convention
-	namingConvention := "S#E#"
-
-	fmt.Printf("Debug: Using flexible naming convention: %s\n", namingConvention)
-
-	videoFiles := findFiles(folderPath, []string{".mkv", ".mp4", ".avi"})
-	subtitleFiles := findFiles(folderPath, []string{".srt", ".ass"})
-
-	fmt.Printf(
-		"Debug: Found %d video files and %d subtitle files\n",
-		len(videoFiles),
-		len(subtitleFiles),
-	)
+	subtitleFiles, err := findFiles(config.FolderPath, subtitleExtensions)
+	if err != nil {
+		exitWithError(err)
+	}
 
 	if len(videoFiles) == 0 && len(subtitleFiles) == 0 {
-		exitWithError(
-			"Error: No video or subtitle files found. Please check the folder path and naming conventions.",
-		)
+		exitWithError(errors.New("no video or subtitle files found"))
 	}
 
 	if len(videoFiles) != len(subtitleFiles) {
-		fmt.Println("Warning: Number of video files does not match number of subtitle files")
 		fmt.Printf(
-			"Found %d video files and %d subtitle files\n",
+			"Warning: found %d video files and %d subtitle files.\n",
 			len(videoFiles),
 			len(subtitleFiles),
 		)
-		fmt.Println("Press enter to continue or ctrl+c to exit...")
-		fmt.Scanln()
 	}
 
 	pairs, unmatched := createFilePairs(videoFiles, subtitleFiles)
 	displayPairsAndUnmatched(pairs, unmatched)
 
-	if confirmRename() {
-		renamePairs(pairs, animeName)
-	} else {
-		fmt.Println("Renaming cancelled.")
+	operations := buildRenameOperations(pairs, config.AnimeName)
+
+	if err := preflightRenameOperations(operations); err != nil {
+		exitWithError(err)
 	}
 
-	fmt.Println("All done :) またねー！")
-	fmt.Println("Press enter to exit...")
-	fmt.Scanln()
+	if config.DryRun {
+		fmt.Println("\nDry-run mode enabled. No files will be changed.")
+		if err := executeRenameOperations(operations, true); err != nil {
+			exitWithError(err)
+		}
+		fmt.Println("Dry-run complete.")
+		return
+	}
+
+	confirmed, err := confirmRename()
+	if err != nil {
+		exitWithError(err)
+	}
+
+	if !confirmed {
+		fmt.Println("Renaming cancelled.")
+		return
+	}
+
+	if err := executeRenameOperations(operations, false); err != nil {
+		exitWithError(err)
+	}
+
+	fmt.Println("All done :)")
 }
 
-func getUserInputLine(prompt string) string {
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Println(prompt)
-	input, _ := reader.ReadString('\n')
+func loadConfig() (AppConfig, error) {
+	var dryRun bool
+	flag.BoolVar(&dryRun, "dry-run", false, "print planned renames without changing files")
+	flag.Parse()
 
-	return strings.TrimSpace(input)
+	folderPath, err := getUserInputLine("Enter the path to the folder containing the videos and subtitles: ")
+	if err != nil {
+		return AppConfig{}, fmt.Errorf("reading folder path: %w", err)
+	}
+
+	if err := validateFolderPath(folderPath); err != nil {
+		return AppConfig{}, err
+	}
+
+	animeName, err := getUserInputLine("Enter the name of the anime: ")
+	if err != nil {
+		return AppConfig{}, fmt.Errorf("reading anime name: %w", err)
+	}
+
+	if err := validateAnimeName(animeName); err != nil {
+		return AppConfig{}, err
+	}
+
+	return AppConfig{
+		FolderPath: folderPath,
+		AnimeName:  animeName,
+		DryRun:     dryRun,
+	}, nil
 }
 
-func exitWithError(message string) {
-	fmt.Println(message)
-	fmt.Println("Press enter to exit...")
-	fmt.Scanln()
+func validateFolderPath(folderPath string) error {
+	if strings.TrimSpace(folderPath) == "" {
+		return errors.New("folder path is empty")
+	}
 
+	info, err := os.Stat(folderPath)
+	if err != nil {
+		return fmt.Errorf("checking folder path: %w", err)
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("folder path is not a directory: %s", folderPath)
+	}
+
+	return nil
+}
+
+func validateAnimeName(animeName string) error {
+	if strings.TrimSpace(animeName) == "" {
+		return errors.New("anime name is empty")
+	}
+
+	if strings.ContainsAny(animeName, `<>:"/\|?*`) {
+		return fmt.Errorf("anime name contains invalid filename characters: %s", animeName)
+	}
+
+	return nil
+}
+
+func getUserInputLine(prompt string) (string, error) {
+	fmt.Print(prompt)
+	input, err := stdinReader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+
+	trimmedInput := strings.TrimSpace(input)
+	if errors.Is(err, io.EOF) && trimmedInput == "" {
+		return "", io.EOF
+	}
+
+	return trimmedInput, nil
+}
+
+func exitWithError(err error) {
+	fmt.Printf("Error: %v\n", err)
 	os.Exit(1)
 }
 
-func findFiles(folderPath string, extensions []string) []FileInfo {
-	var files []FileInfo
-	extensionSet := make(map[string]bool)
+func findFiles(folderPath string, extensions []string) ([]FileInfo, error) {
+	files := []FileInfo{}
+	extensionSet := map[string]struct{}{}
 
 	for _, ext := range extensions {
-		extensionSet[ext] = true
+		normalizedExtension := strings.ToLower(ext)
+		extensionSet[normalizedExtension] = struct{}{}
 	}
-
-	pattern := createFlexiblePattern()
 
 	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			fmt.Printf("Error accessing path %q: %v\n", path, err)
-			return nil
+			return fmt.Errorf("accessing path %q: %w", path, err)
 		}
 
 		if info.IsDir() {
 			return nil
 		}
 
-		ext := filepath.Ext(path)
-		if !extensionSet[ext] {
+		ext := strings.ToLower(filepath.Ext(path))
+		if _, exists := extensionSet[ext]; !exists {
 			return nil
 		}
 
 		baseName := filepath.Base(path)
-		if !pattern.MatchString(baseName) {
-			fmt.Printf("Debug: File not matched: %s\n", baseName)
+		if !flexiblePattern.MatchString(baseName) {
 			return nil
 		}
 
-		fmt.Printf("Debug: Matched file: %s\n", baseName)
 		season, episode := extractSeasonAndEpisode(baseName)
-		fmt.Printf("Debug: Extracted Season: %d, Episode: %d\n", season, episode)
-
 		if episode == 0 {
-			fmt.Printf("Debug: Skipped file (no valid episode number): %s\n", baseName)
 			return nil
 		}
 
@@ -178,56 +307,38 @@ func findFiles(folderPath string, extensions []string) []FileInfo {
 	})
 
 	if err != nil {
-		fmt.Printf("Error walking the path %q: %v\n", folderPath, err)
+		return nil, fmt.Errorf("walking folder %q: %w", folderPath, err)
 	}
 
-	return files
+	return files, nil
 }
 
 func extractSeasonAndEpisode(filename string) (int, int) {
-	seasonStr := ""
-	episodeStr := ""
+	filenameWithoutExtension := strings.TrimSuffix(filename, filepath.Ext(filename))
 
-	// Array of patterns to try
-	patterns := []struct {
-		regex                     *regexp.Regexp
-		seasonIndex, episodeIndex int
-	}{
-		{regexp.MustCompile(`S(\d+)\s*-\s*(\d+)`), 1, 2}, // S1 - 01
-		{
-			regexp.MustCompile(`S(\d+)(?:\s|E)(\d+)`),
-			1,
-			2,
-		}, // S1E01 or S01E01 or S1 01 etc
-		{regexp.MustCompile(`E(\d+)`), 0, 1},              // E01
-		{regexp.MustCompile(`\s-\s\(?(\d+)\)?`), 0, 1},    // - 01 or - (01)
-		{regexp.MustCompile(`\s(\d{2,3})(?:\s|$)`), 0, 1}, // 01 or 001 at the end or before space
-	}
-
-	for _, pattern := range patterns {
-		if match := pattern.regex.FindStringSubmatch(filename); len(match) > pattern.episodeIndex {
-			if pattern.seasonIndex > 0 {
-				seasonStr = match[pattern.seasonIndex]
-			}
-
-			episodeStr = match[pattern.episodeIndex]
-			break
+	for _, pattern := range episodePatterns {
+		match := pattern.regex.FindStringSubmatch(filenameWithoutExtension)
+		if len(match) <= pattern.episodeIndex {
+			continue
 		}
+
+		episode, err := strconv.Atoi(match[pattern.episodeIndex])
+		if err != nil || episode == 0 {
+			continue
+		}
+
+		season := 1
+		if pattern.seasonIndex > 0 {
+			parsedSeason, parseErr := strconv.Atoi(match[pattern.seasonIndex])
+			if parseErr == nil && parsedSeason > 0 {
+				season = parsedSeason
+			}
+		}
+
+		return season, episode
 	}
 
-	season, _ := strconv.Atoi(seasonStr)
-	episode, _ := strconv.Atoi(episodeStr)
-
-	// If no season found, default to 1
-	if season == 0 {
-		season = 1
-	}
-
-	return season, episode
-}
-
-func createFlexiblePattern() *regexp.Regexp {
-	return regexp.MustCompile(`\d+`)
+	return 1, 0
 }
 
 func createFilePairs(videoFiles, subtitleFiles []FileInfo) ([]FilePair, []FileInfo) {
@@ -279,24 +390,30 @@ func displayPairsAndUnmatched(pairs []FilePair, unmatched []FileInfo) {
 	}
 }
 
-func confirmRename() bool {
-	reader := bufio.NewReader(os.Stdin)
+func confirmRename() (bool, error) {
 	for {
-		fmt.Print("\nDo you want to proceed with renaming? (yes/no): ")
-		response, _ := reader.ReadString('\n')
+		response, err := getUserInputLine("\nDo you want to proceed with renaming? (yes/no): ")
+		if err != nil {
+			return false, err
+		}
+
 		response = strings.ToLower(strings.TrimSpace(response))
 
 		if response == "yes" || response == "y" {
-			return true
-		} else if response == "no" || response == "n" {
-			return false
+			return true, nil
 		}
 
-		fmt.Println("Please answer 'yes' or 'no'.")
+		if response == "no" || response == "n" {
+			return false, nil
+		}
+
+		fmt.Println("Please answer with yes/y or no/n.")
 	}
 }
 
-func renamePairs(pairs []FilePair, animeName string) {
+func buildRenameOperations(pairs []FilePair, animeName string) []RenameOperation {
+	operations := make([]RenameOperation, 0, len(pairs)*2)
+
 	for _, pair := range pairs {
 		newVideoName := fmt.Sprintf(
 			"%s - S%02dE%02d%s",
@@ -314,20 +431,239 @@ func renamePairs(pairs []FilePair, animeName string) {
 			pair.Subtitle.Extension,
 		)
 
-		renameFile(pair.Video.Path, filepath.Join(filepath.Dir(pair.Video.Path), newVideoName))
-		renameFile(
-			pair.Subtitle.Path,
-			filepath.Join(filepath.Dir(pair.Subtitle.Path), newSubtitleName),
-		)
+		operations = append(operations, RenameOperation{
+			OldPath: pair.Video.Path,
+			NewPath: filepath.Join(filepath.Dir(pair.Video.Path), newVideoName),
+		})
+
+		operations = append(operations, RenameOperation{
+			OldPath: pair.Subtitle.Path,
+			NewPath: filepath.Join(filepath.Dir(pair.Subtitle.Path), newSubtitleName),
+		})
 	}
+
+	return operations
 }
 
-func renameFile(oldPath, newPath string) {
-	err := os.Rename(oldPath, newPath)
+func preflightRenameOperations(operations []RenameOperation) error {
+	issues := []string{}
 
-	if err != nil {
-		fmt.Printf("Error renaming file %s to %s: %v\n", oldPath, newPath, err)
-	} else {
-		fmt.Printf("Renamed: %s -> %s\n", oldPath, newPath)
+	if len(operations) == 0 {
+		issues = append(issues, "no matched file pairs were found")
 	}
+
+	sourcePaths := map[string]struct{}{}
+	targetPaths := map[string]struct{}{}
+
+	for _, operation := range operations {
+		if strings.TrimSpace(operation.OldPath) == "" {
+			issues = append(issues, "operation contains empty source path")
+			continue
+		}
+
+		if strings.TrimSpace(operation.NewPath) == "" {
+			issues = append(issues, fmt.Sprintf("operation for %s contains empty target path", operation.OldPath))
+			continue
+		}
+
+		sourcePaths[operation.OldPath] = struct{}{}
+
+		if _, err := os.Stat(operation.OldPath); err != nil {
+			issues = append(issues, fmt.Sprintf("source file does not exist or is not readable: %s", operation.OldPath))
+			continue
+		}
+
+		if operation.OldPath == operation.NewPath {
+			continue
+		}
+
+		if _, exists := targetPaths[operation.NewPath]; exists {
+			issues = append(issues, fmt.Sprintf("duplicate target path detected: %s", operation.NewPath))
+			continue
+		}
+
+		targetPaths[operation.NewPath] = struct{}{}
+	}
+
+	for targetPath := range targetPaths {
+		if _, exists := sourcePaths[targetPath]; exists {
+			continue
+		}
+
+		_, statErr := os.Stat(targetPath)
+		if statErr == nil {
+			issues = append(issues, fmt.Sprintf("target path already exists: %s", targetPath))
+			continue
+		}
+
+		if !errors.Is(statErr, os.ErrNotExist) {
+			issues = append(issues, fmt.Sprintf("unable to validate target path %s: %v", targetPath, statErr))
+		}
+	}
+
+	if len(issues) > 0 {
+		return &PreflightError{Issues: issues}
+	}
+
+	return nil
+}
+
+func executeRenameOperations(operations []RenameOperation, dryRun bool) error {
+	return executeRenameOperationsWith(operations, dryRun, os.Rename)
+}
+
+func executeRenameOperationsWith(
+	operations []RenameOperation,
+	dryRun bool,
+	renameFn renameExecutor,
+) error {
+	if dryRun {
+		for _, operation := range operations {
+			if operation.OldPath == operation.NewPath {
+				fmt.Printf("[dry-run] No change: %s\n", operation.OldPath)
+				continue
+			}
+
+			fmt.Printf("[dry-run] %s -> %s\n", operation.OldPath, operation.NewPath)
+		}
+
+		return nil
+	}
+
+	states := make([]renameState, 0, len(operations))
+
+	for index, operation := range operations {
+		if operation.OldPath == operation.NewPath {
+			fmt.Printf("No change: %s\n", operation.OldPath)
+			continue
+		}
+
+		tempPath, err := buildTempPath(operation.OldPath, index)
+		if err != nil {
+			return err
+		}
+
+		states = append(states, renameState{
+			RenameOperation: operation,
+			TempPath:        tempPath,
+			CurrentPath:     operation.OldPath,
+		})
+	}
+
+	if len(states) == 0 {
+		fmt.Println("No files need renaming.")
+		return nil
+	}
+
+	for index := range states {
+		state := &states[index]
+		if err := renameFn(state.CurrentPath, state.TempPath); err != nil {
+			executionErr := &RenameExecutionError{
+				Phase: "phase-one",
+				From:  state.CurrentPath,
+				To:    state.TempPath,
+				Err:   err,
+			}
+
+			rollbackErr := rollbackRenameStates(states, renameFn)
+			if rollbackErr != nil {
+				return errors.Join(executionErr, fmt.Errorf("rollback failed: %w", rollbackErr))
+			}
+
+			return executionErr
+		}
+
+		state.CurrentPath = state.TempPath
+	}
+
+	for index := range states {
+		state := &states[index]
+		if err := renameFn(state.CurrentPath, state.NewPath); err != nil {
+			executionErr := &RenameExecutionError{
+				Phase: "phase-two",
+				From:  state.CurrentPath,
+				To:    state.NewPath,
+				Err:   err,
+			}
+
+			rollbackErr := rollbackRenameStates(states, renameFn)
+			if rollbackErr != nil {
+				return errors.Join(executionErr, fmt.Errorf("rollback failed: %w", rollbackErr))
+			}
+
+			return executionErr
+		}
+
+		state.CurrentPath = state.NewPath
+	}
+
+	for _, state := range states {
+		fmt.Printf("Renamed: %s -> %s\n", state.OldPath, state.NewPath)
+	}
+
+	return nil
+}
+
+func buildTempPath(oldPath string, index int) (string, error) {
+	dir := filepath.Dir(oldPath)
+	base := filepath.Base(oldPath)
+
+	for attempt := 0; attempt < 1000; attempt++ {
+		candidate := filepath.Join(
+			dir,
+			fmt.Sprintf(".anime-renamer-tmp-%d-%d-%s", os.Getpid(), index*1000+attempt, base),
+		)
+
+		_, err := os.Stat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		}
+
+		if err != nil {
+			return "", fmt.Errorf("checking temp path %s: %w", candidate, err)
+		}
+	}
+
+	return "", fmt.Errorf("failed to allocate temp path for %s", oldPath)
+}
+
+func rollbackRenameStates(states []renameState, renameFn renameExecutor) error {
+	rollbackErrors := []error{}
+
+	for index := len(states) - 1; index >= 0; index-- {
+		state := states[index]
+		if state.CurrentPath == state.OldPath {
+			continue
+		}
+
+		_, statErr := os.Stat(state.CurrentPath)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				rollbackErrors = append(
+					rollbackErrors,
+					fmt.Errorf("rollback source disappeared: %s", state.CurrentPath),
+				)
+				continue
+			}
+
+			rollbackErrors = append(
+				rollbackErrors,
+				fmt.Errorf("rollback stat failed for %s: %w", state.CurrentPath, statErr),
+			)
+			continue
+		}
+
+		if err := renameFn(state.CurrentPath, state.OldPath); err != nil {
+			rollbackErrors = append(
+				rollbackErrors,
+				fmt.Errorf("rollback failed (%s -> %s): %w", state.CurrentPath, state.OldPath, err),
+			)
+		}
+	}
+
+	if len(rollbackErrors) > 0 {
+		return errors.Join(rollbackErrors...)
+	}
+
+	return nil
 }
